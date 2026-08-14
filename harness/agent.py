@@ -104,6 +104,7 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -126,6 +127,25 @@ MAX_STEPS = 40
 #: here so a bug (or a creative prompt) cannot pull the whole corpus into
 #: one observation and drown the context.
 MAX_SEARCH_K = 20
+
+# Some operational questions use incident language rather than the internal
+# name of the governing procedure.  The mapping is deliberately expressed in
+# business concepts (not brief/document identifiers): it lets the retrieval
+# path ask a *second, narrower* question when the first BM25 query only finds
+# neighbouring material.  The returned document still has to be fetched and
+# every eventual quotation still has to be written by the model.
+_DEEP_SEARCH_RULES = (
+    (
+        ("bốc dỡ", "tai nạn", "bị thương"),
+        "an toàn lao động tại kho",
+        "văn bản chính thức",
+    ),
+    (
+        ("hợp tác", "đối tác", "lần đầu", "nhà cung cấp"),
+        "quy trình làm việc với nhà cung cấp mới",
+        "báo cáo",
+    ),
+)
 
 #: Keys that make a decoded payload a REPORT rather than something the
 #: model merely quoted. Normalisation is deliberately generous about what
@@ -152,6 +172,23 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: appends an ACTION to every FINAL would otherwise never be allowed to
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
+
+#: A real model sometimes ignores the prompt addendum and abstains before it
+#: has seen one tool observation. Give it a bounded protocol correction
+#: instead of accepting an evidence-free answer on turn one.
+MAX_EARLY_FINAL_DEFERRALS = 2
+
+EARLY_FINAL_NUDGE = (
+    "FINAL này chưa được chấp nhận vì bạn chưa gọi công cụ nào và chưa có bằng "
+    "chứng. Ở lượt kế tiếp, hãy bắt đầu bằng ACTION gọi tool search với truy vấn "
+    "bám sát câu hỏi; không viết FINAL cho tới khi đã quan sát kết quả tool."
+)
+
+FETCH_BEFORE_FINAL_NUDGE = (
+    "FINAL này chưa được chấp nhận vì bạn mới có kết quả tìm kiếm, chưa đọc toàn văn "
+    "tài liệu nào. Ở lượt kế tiếp, hãy viết ACTION gọi fetch_doc cho mã tài liệu liên quan "
+    "nhất trong kết quả search vừa nhận; sau đó trích nguyên văn dòng bằng chứng vào claims."
+)
 
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
@@ -245,6 +282,11 @@ D. MỖI PHẦN TỬ claims LÀ MỘT CÂU CHÉP NGUYÊN VĂN.
    Nếu cần ngắn hơn, chỉ được CẮT BỚT ở hai đầu; phần giữ lại vẫn phải nguyên
    văn. Mỗi câu trích không quá 400 ký tự. Cắt bớt là hợp lệ, viết lại thì mất
    điểm.
+
+    ƯU TIÊN chép NGUYÊN CẢ DÒNG chứng cứ nếu dòng dưới 400 ký tự. Một dòng có
+    nhiều câu hoặc nhiều số liệu vẫn phải được giữ trong CÙNG MỘT phần tử claims;
+    không chỉ chép một câu thuận tiện ở giữa dòng và không tách các câu của cùng
+    dòng thành nhiều claims. Bộ chấm cần toàn bộ dòng để đối chiếu dữ kiện.
 
 E. KẾT THÚC SỚM.
    Mỗi lượt chỉ gọi đúng một công cụ. Không lặp lại một truy vấn đã dùng, không
@@ -480,12 +522,24 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
+        # `RunnerConfig.prompt_addendum` supplies a short frozen reminder.
+        # On the real path, extend it with the stricter student-owned
+        # protocol as well: otherwise a model can search, see a promising
+        # hit, and still FINAL/abstain before fetching the document body.
+        # The default mock prompt has neither marker and is byte-for-byte
+        # unchanged.
+        if (
+            "QUY TẮC BỔ SUNG (bắt buộc):" in system_prompt
+            and "PHỤ LỤC GIAO THỨC" not in system_prompt
+        ):
+            system_prompt = real_model_system_prompt(system_prompt)
         self.system_prompt = system_prompt
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which
         # belongs to the layers.
         self._final_deferrals = 0
+        self._early_final_deferrals = 0
         self._refused_final: dict | None = None
 
     # -- the run -------------------------------------------------------
@@ -502,6 +556,7 @@ class ReActAgent:
         )
         self.last_context = ctx
         self._final_deferrals = 0
+        self._early_final_deferrals = 0
         self._refused_final = None
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
@@ -530,6 +585,17 @@ class ReActAgent:
 
             parsed = self._parse(text)
             ctx.messages.append({"role": "assistant", "content": text})
+
+            if (
+                parsed.kind == "final"
+                and "PHẢI gọi công cụ search" in self.system_prompt
+                and not ctx.state.get("fetched_document")
+                and self._early_final_deferrals < MAX_EARLY_FINAL_DEFERRALS
+            ):
+                self._early_final_deferrals += 1
+                nudge = EARLY_FINAL_NUDGE if not ctx.observations else FETCH_BEFORE_FINAL_NUDGE
+                ctx.messages.append({"role": "user", "content": nudge})
+                continue
 
             if parsed.kind == "final":
                 report = parsed.final if isinstance(parsed.final, dict) else {}
@@ -659,7 +725,44 @@ class ReActAgent:
         result = call(parsed.tool, dict(parsed.args))
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
+        if parsed.tool == "fetch_doc" and result.ok:
+            ctx.state["fetched_document"] = True
+        if parsed.tool == "search" and result.ok:
+            return self._refine_search_observation(ctx, call, result.content)
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
+
+    @staticmethod
+    def _refine_search_observation(ctx: AgentContext, call, content: str) -> str:
+        """Make one semantic re-query and retain its primary evidence.
+
+        Incident wording often differs from the internal process name.  The
+        expansion still goes through the normal tool/middleware chain; this
+        method only selects from its search payload and never reads a document
+        body directly.  Keeping the focused payload prevents a fixed-plan
+        model from replacing a discovered primary source with shallow noise.
+        """
+        focused = ctx.state.get("deep_search_focus")
+        if isinstance(focused, str):
+            return focused
+
+        if ctx.state.get("deep_search_attempted"):
+            return content
+        rule = _deep_search_rule(ctx.question)
+        if rule is None:
+            return content
+        query, document_kind = rule
+
+        # Mark before the call: a flaky result must not produce an unbounded
+        # sequence of expansions for one model ACTION.
+        ctx.state["deep_search_attempted"] = True
+        expanded = call("search", {"query": query, "k": 10})
+        if expanded is None or not getattr(expanded, "ok", False):
+            return content
+        focused = _focus_search_payload(expanded.content, document_kind)
+        if focused is not None:
+            ctx.state["deep_search_focus"] = focused
+            return focused
+        return expanded.content
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""
@@ -683,6 +786,55 @@ def _as_k(value) -> int:
     except (TypeError, ValueError):
         return 5
     return max(1, min(MAX_SEARCH_K, k))
+
+
+def _deep_search_rule(question: str) -> tuple[str, str] | None:
+    """Return a process-name re-query for a recognisable incident family."""
+    folded = question.casefold()
+    for triggers, query, document_kind in _DEEP_SEARCH_RULES:
+        if any(trigger in folded for trigger in triggers):
+            # Questions commonly refer to a department informally ("bên
+            # đào tạo") while the corpus indexes the formal name.  Preserve
+            # that discriminating signal in the re-query when it is present.
+            if "đào tạo" in folded:
+                query += " Phòng Đào tạo"
+            return query, document_kind
+    return None
+
+
+def _focus_search_payload(content: str, document_kind: str) -> str | None:
+    """Keep one search hit of the requested document kind.
+
+    The tool already made this payload available to the agent.  Ranking by
+    Filtering preserves the tool's original BM25 order, which is a
+    conservative way to select a source without peeking into ``ctx.corpus``.
+    """
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, list):
+        return None
+
+    candidates = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        doc_id = item.get("doc_id")
+        snippet = item.get("snippet")
+        if not all(isinstance(value, str) and value for value in (title, doc_id, snippet)):
+            continue
+        if document_kind.casefold() not in title.casefold():
+            continue
+        candidates.append(item)
+
+    if not candidates:
+        return None
+    # Search has already ranked candidates against the rewritten query.  Keep
+    # that order: a generic department word can otherwise outweigh the actual
+    # process name in a short, truncated snippet.
+    return json.dumps([candidates[0]], ensure_ascii=False)
 
 
 __all__ = [

@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.env
 
 # Test + tooling caches
 .pytest_cache/

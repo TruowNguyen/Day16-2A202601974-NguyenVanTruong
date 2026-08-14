@@ -61,7 +61,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+from arena.model import RealModelError, is_degraded
 
 from harness.middleware import Middleware
 
@@ -70,6 +70,25 @@ DEFAULT_MAX_ATTEMPTS = 3
 
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
+
+# One request can fail before the agent has received any model output at all.
+# Retry only transport/provider failures that are normally transient; a 401,
+# malformed endpoint response, or missing configuration must remain visible.
+_TRANSIENT_MODEL_FAILURES = (
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "connection aborted",
+    "forcibly closed by the remote host",
+    "winerror 10054",
+    "remote end closed",
+    "http error 429",
+    "http error 500",
+    "http error 502",
+    "http error 503",
+    "http error 504",
+)
 
 
 class Retry(Middleware):
@@ -85,17 +104,35 @@ class Retry(Middleware):
         self.max_attempts = max(1, int(max_attempts))
         self.reserve = max(0, int(reserve))
 
+    def wrap_model_call(self, ctx, call, messages):
+        """Retry a transient endpoint failure once before aborting the brief."""
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                response = call(messages)
+            except RealModelError as exc:
+                detail = str(exc).casefold()
+                retryable = any(marker in detail for marker in _TRANSIENT_MODEL_FAILURES)
+                # Model requests do not consume the tool reserve.  Two tries
+                # is enough to absorb a one-off gateway/read timeout without
+                # turning an unavailable endpoint into a long busy loop.
+                if not retryable or attempts >= min(self.max_attempts, 2):
+                    raise
+                continue
+            ctx.state["model_retry_attempts"] = attempts
+            return response
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        while attempts < self.max_attempts and (
+            not result.ok or is_degraded(result.content)
+        ):
+            limit = ctx.max_tool_calls
+            if limit is not None and ctx.tools.calls >= limit - self.reserve:
+                break
+            result = call(name, args)
+            attempts += 1
+        ctx.state["retry_attempts"] = attempts
+        return result
